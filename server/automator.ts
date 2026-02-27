@@ -24,6 +24,11 @@ const CHROMIUM_PATH = findChromium();
 const runningTasks = new Map<string, boolean>();
 let cachedProxies: string[] = [];
 let proxyFetchTime = 0;
+let activeBrowser: any = null;
+
+process.on("SIGTERM", async () => {
+  try { await activeBrowser?.close(); } finally { process.exit(0); }
+});
 
 export function isTaskRunning(taskId: string): boolean {
   return runningTasks.get(taskId) === true;
@@ -73,7 +78,6 @@ function buildBrowserArgs(proxyHost?: string, ua?: string): string[] {
     "--disable-software-rasterizer",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
-    "--single-process",
     "--no-zygote",
     "--disable-extensions",
     "--disable-background-networking",
@@ -138,6 +142,7 @@ export async function executeTask(task: Task) {
 
   const launched = await launchBrowser(proxies);
   const browser = launched.browser;
+  activeBrowser = browser;
   const proxyAuth = launched.proxyAuth;
   const proxyLabel = launched.proxyLabel;
   console.log(`[Task] Browser launched with proxy: ${proxyLabel}`);
@@ -168,6 +173,7 @@ export async function executeTask(task: Task) {
   }
 
   try { await browser.close(); } catch (_) {}
+  activeBrowser = null;
   if (runningTasks.get(task.id)) await storage.updateTask(task.id, { status: "completed" });
   runningTasks.delete(task.id);
   console.log(`[Task] Finished`);
