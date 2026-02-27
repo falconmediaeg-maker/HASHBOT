@@ -45,7 +45,7 @@ async function fetchProxyList(proxyListUrl: string): Promise<string[]> {
   }
   try {
     console.log(`[Proxy] Fetching proxy list...`);
-    const controller = new globalThis.AbortController();
+    const controller = new AbortController();
     const tid = setTimeout(() => controller.abort(), 15000);
     const res = await fetch(proxyListUrl, { signal: controller.signal });
     clearTimeout(tid);
@@ -78,6 +78,7 @@ function buildBrowserArgs(proxyHost?: string, ua?: string): string[] {
     "--disable-software-rasterizer",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
+    "--single-process",
     "--no-zygote",
     "--disable-extensions",
     "--disable-background-networking",
@@ -180,11 +181,14 @@ export async function executeTask(task: Task) {
 }
 
 async function performPageVote(browser: any, proxyAuth: { username: string; password: string } | null, proxyLabel: string, task: Task, runNumber: number): Promise<{ ip?: string; message: string }> {
-  const context = await browser.createIncognitoBrowserContext();
-  const page = await context.newPage();
+  const page = await browser.newPage();
 
   try {
     if (proxyAuth) await page.authenticate(proxyAuth);
+
+    const client = await page.target().createCDPSession();
+    await client.send("Network.clearBrowserCookies");
+    await client.send("Network.clearBrowserCache");
 
     await page.setViewport({ width: 1366, height: 768 });
 
@@ -229,12 +233,12 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
     let currentUrl = "";
     try { currentUrl = page.url(); } catch (_e) { currentUrl = "redirected"; }
 
-    await context.close();
+    await page.close();
 
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
     return { ip: proxyLabel, message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Proxy: ${proxyLabel} - Final: ${currentUrl}` };
   } catch (error: any) {
-    try { await context.close(); } catch (_) {}
+    try { await page.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
       return { ip: proxyLabel, message: `Run #${runNumber} - VOTED (redirected) - Proxy: ${proxyLabel}` };
     }
