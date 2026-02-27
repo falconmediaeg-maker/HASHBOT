@@ -2,6 +2,7 @@ import puppeteer from "puppeteer-core";
 import { storage } from "./storage";
 import type { Task, Action } from "@shared/schema";
 import { execSync } from "child_process";
+import os from "os";
 
 function findChromium(): string {
   const candidates = [
@@ -137,6 +138,17 @@ async function createBrowser(proxies: string[]): Promise<{ browser: any; proxyAu
   return launched;
 }
 
+function isHighMemory(): boolean {
+  const rss = process.memoryUsage().rss;
+  const total = os.totalmem();
+  const pct = (rss / total) * 100;
+  if (pct > 60) {
+    console.log(`[Memory Guard] ${Math.round(pct)}% RAM used (${Math.round(rss / 1024 / 1024)}MB / ${Math.round(total / 1024 / 1024)}MB), recycling browser...`);
+    return true;
+  }
+  return false;
+}
+
 export async function executeTask(task: Task) {
   if (isTaskRunning(task.id)) return;
 
@@ -149,6 +161,7 @@ export async function executeTask(task: Task) {
   if (webshareUrl) proxies = await fetchProxyList(webshareUrl);
 
   let { browser, proxyAuth, proxyLabel } = await createBrowser(proxies);
+  let consecutiveFailures = 0;
 
   for (let i = 1; i <= task.repetitions; i++) {
     if (!runningTasks.get(task.id)) {
@@ -175,9 +188,17 @@ export async function executeTask(task: Task) {
       proxyLabel = relaunched.proxyLabel;
     }
 
-    const mem = process.memoryUsage().rss / 1024 / 1024;
-    if (mem > 1500) {
-      console.log(`[Memory Guard] High memory (${Math.round(mem)}MB), recycling browser...`);
+    if (i > 1 && i % 200 === 1) {
+      console.log("[Batch] 200-run batch complete, pausing 30s...");
+      try { await browser.close(); } catch {}
+      await delay(30000);
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
+    }
+
+    if (isHighMemory()) {
       try { await browser.close(); } catch {}
       const relaunched = await createBrowser(proxies);
       browser = relaunched.browser;
@@ -192,15 +213,23 @@ export async function executeTask(task: Task) {
           setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)
         ),
       ]);
+      consecutiveFailures = 0;
       const currentTask = await storage.getTask(task.id);
       if (currentTask) await storage.updateTask(task.id, { completedRuns: (currentTask.completedRuns || 0) + 1 });
       await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "success", ipUsed: result.ip || "direct", message: result.message });
       console.log(`[Task] Run ${i}/${task.repetitions} SUCCESS - ${result.ip || "direct"}`);
     } catch (error: any) {
+      consecutiveFailures++;
       const currentTask = await storage.getTask(task.id);
       if (currentTask) await storage.updateTask(task.id, { failedRuns: (currentTask.failedRuns || 0) + 1 });
       await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "failed", message: error.message || "Unknown error" });
-      console.log(`[Task] Run ${i}/${task.repetitions} FAILED - ${error.message}`);
+      console.log(`[Task] Run ${i}/${task.repetitions} FAILED - ${error.message} (consecutive: ${consecutiveFailures})`);
+
+      if (consecutiveFailures >= 5) {
+        console.log("[Self-Heal] 5 consecutive failures, restarting service...");
+        try { await browser.close(); } catch {}
+        process.exit(1);
+      }
 
       if (error.message?.includes("timeout") || error.message?.includes("Protocol") || error.message?.includes("Target closed")) {
         console.log("[Recovery] Critical error, relaunching browser...");
@@ -229,14 +258,11 @@ export async function executeTask(task: Task) {
 }
 
 async function performPageVote(browser: any, proxyAuth: { username: string; password: string } | null, proxyLabel: string, task: Task, runNumber: number): Promise<{ ip?: string; message: string }> {
-  const page = await browser.newPage();
+  const context = await browser.createIncognitoBrowserContext();
+  const page = await context.newPage();
 
   try {
     if (proxyAuth) await page.authenticate(proxyAuth);
-
-    const client = await page.target().createCDPSession();
-    await client.send("Network.clearBrowserCookies");
-    await client.send("Network.clearBrowserCache");
 
     await page.setViewport({ width: 1366, height: 768 });
 
@@ -283,11 +309,13 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
 
     page.removeAllListeners();
     await page.close();
+    await context.close();
 
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
     return { ip: proxyLabel, message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Proxy: ${proxyLabel} - Final: ${currentUrl}` };
   } catch (error: any) {
     try { page.removeAllListeners(); await page.close(); } catch (_) {}
+    try { await context.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
       return { ip: proxyLabel, message: `Run #${runNumber} - VOTED (redirected) - Proxy: ${proxyLabel}` };
     }
