@@ -174,7 +174,8 @@ export async function executeTask(task: Task) {
 }
 
 async function performPageVote(browser: any, proxyAuth: { username: string; password: string } | null, proxyLabel: string, task: Task, runNumber: number): Promise<{ ip?: string; message: string }> {
-  const page = await browser.newPage();
+  const context = await browser.createIncognitoBrowserContext();
+  const page = await context.newPage();
 
   try {
     if (proxyAuth) await page.authenticate(proxyAuth);
@@ -222,12 +223,12 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
     let currentUrl = "";
     try { currentUrl = page.url(); } catch (_e) { currentUrl = "redirected"; }
 
-    await page.close();
+    await context.close();
 
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
     return { ip: proxyLabel, message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Proxy: ${proxyLabel} - Final: ${currentUrl}` };
   } catch (error: any) {
-    try { await page.close(); } catch (_) {}
+    try { await context.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
       return { ip: proxyLabel, message: `Run #${runNumber} - VOTED (redirected) - Proxy: ${proxyLabel}` };
     }
@@ -341,7 +342,7 @@ function buildCssSelector(htmlOrSelector: string): string | null {
 
   if (tagMatch && nameMatch) {
     let sel = `${tagMatch[1]}[name="${nameMatch[1]}"]`;
-    if (valueMatch) sel += `[value="${valueMatch[1]}"]`;
+    if (valueValue) sel += `[value="${valueMatch[1]}"]`;
     if (typeMatch) sel += `[type="${typeMatch[1]}"]`;
     return sel;
   }
