@@ -258,11 +258,14 @@ export async function executeTask(task: Task) {
 }
 
 async function performPageVote(browser: any, proxyAuth: { username: string; password: string } | null, proxyLabel: string, task: Task, runNumber: number): Promise<{ ip?: string; message: string }> {
-  const context = await browser.createIncognitoBrowserContext();
-  const page = await context.newPage();
+  const page = await browser.newPage();
 
   try {
     if (proxyAuth) await page.authenticate(proxyAuth);
+
+    const client = await page.target().createCDPSession();
+    await client.send("Network.clearBrowserCookies");
+    await client.send("Network.clearBrowserCache");
 
     await page.setViewport({ width: 1366, height: 768 });
 
@@ -309,13 +312,11 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
 
     page.removeAllListeners();
     await page.close();
-    await context.close();
 
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
     return { ip: proxyLabel, message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Proxy: ${proxyLabel} - Final: ${currentUrl}` };
   } catch (error: any) {
     try { page.removeAllListeners(); await page.close(); } catch (_) {}
-    try { await context.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
       return { ip: proxyLabel, message: `Run #${runNumber} - VOTED (redirected) - Proxy: ${proxyLabel}` };
     }
