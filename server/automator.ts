@@ -30,6 +30,11 @@ process.on("SIGTERM", async () => {
   try { await activeBrowser?.close(); } finally { process.exit(0); }
 });
 
+setInterval(() => {
+  const m = process.memoryUsage();
+  console.log(`[Memory] RSS=${Math.round(m.rss / 1024 / 1024)}MB Heap=${Math.round(m.heapUsed / 1024 / 1024)}MB`);
+}, 60000);
+
 export function isTaskRunning(taskId: string): boolean {
   return runningTasks.get(taskId) === true;
 }
@@ -52,7 +57,7 @@ async function fetchProxyList(proxyListUrl: string): Promise<string[]> {
     const text = await res.text();
     const lines = text.trim().split("\n").filter(l => l.trim().length > 0);
     if (lines.length > 0) {
-      const shuffled = lines.sort(() => Math.random() - 0.5).slice(0, 300);
+      const shuffled = lines.sort(() => Math.random() - 0.5).slice(0, 1000);
       cachedProxies = shuffled;
       proxyFetchTime = now;
       console.log(`[Proxy] Fetched ${lines.length} proxies, using ${shuffled.length}`);
@@ -78,7 +83,6 @@ function buildBrowserArgs(proxyHost?: string, ua?: string): string[] {
     "--disable-software-rasterizer",
     "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
-    "--single-process",
     "--no-zygote",
     "--disable-extensions",
     "--disable-background-networking",
@@ -122,12 +126,15 @@ async function launchBrowser(proxies: string[]): Promise<{ browser: any; proxyAu
   const ua = getRandomUserAgent();
   const args = buildBrowserArgs(proxyHost, ua);
 
-  try {
-    const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
-    return { browser, proxyAuth, proxyLabel };
-  } catch (e: any) {
-    throw new Error(`Browser launch failed: ${e.message}`);
-  }
+  const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
+  return { browser, proxyAuth, proxyLabel };
+}
+
+async function createBrowser(proxies: string[]): Promise<{ browser: any; proxyAuth: { username: string; password: string } | null; proxyLabel: string }> {
+  const launched = await launchBrowser(proxies);
+  activeBrowser = launched.browser;
+  console.log(`[Task] Browser launched with proxy: ${launched.proxyLabel}`);
+  return launched;
 }
 
 export async function executeTask(task: Task) {
@@ -141,12 +148,7 @@ export async function executeTask(task: Task) {
   let proxies: string[] = [];
   if (webshareUrl) proxies = await fetchProxyList(webshareUrl);
 
-  const launched = await launchBrowser(proxies);
-  const browser = launched.browser;
-  activeBrowser = browser;
-  const proxyAuth = launched.proxyAuth;
-  const proxyLabel = launched.proxyLabel;
-  console.log(`[Task] Browser launched with proxy: ${proxyLabel}`);
+  let { browser, proxyAuth, proxyLabel } = await createBrowser(proxies);
 
   for (let i = 1; i <= task.repetitions; i++) {
     if (!runningTasks.get(task.id)) {
@@ -155,8 +157,31 @@ export async function executeTask(task: Task) {
       break;
     }
 
+    if (!browser || !browser.isConnected()) {
+      console.log("[Recovery] Browser disconnected, relaunching...");
+      try { await browser?.close(); } catch {}
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
+    }
+
+    if (i > 1 && i % 5 === 1) {
+      console.log("[Recycle] Restarting browser to free memory...");
+      try { await browser.close(); } catch {}
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
+    }
+
     try {
-      const result = await performPageVote(browser, proxyAuth, proxyLabel, task, i);
+      const result = await Promise.race([
+        performPageVote(browser, proxyAuth, proxyLabel, task, i),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)
+        ),
+      ]);
       const currentTask = await storage.getTask(task.id);
       if (currentTask) await storage.updateTask(task.id, { completedRuns: (currentTask.completedRuns || 0) + 1 });
       await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "success", ipUsed: result.ip || "direct", message: result.message });
@@ -166,6 +191,19 @@ export async function executeTask(task: Task) {
       if (currentTask) await storage.updateTask(task.id, { failedRuns: (currentTask.failedRuns || 0) + 1 });
       await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "failed", message: error.message || "Unknown error" });
       console.log(`[Task] Run ${i}/${task.repetitions} FAILED - ${error.message}`);
+
+      if (error.message?.includes("timeout") || error.message?.includes("Protocol") || error.message?.includes("Target closed")) {
+        console.log("[Recovery] Critical error, relaunching browser...");
+        try { await browser.close(); } catch {}
+        try {
+          const relaunched = await createBrowser(proxies);
+          browser = relaunched.browser;
+          proxyAuth = relaunched.proxyAuth;
+          proxyLabel = relaunched.proxyLabel;
+        } catch (relaunchErr: any) {
+          console.log(`[Recovery] Relaunch failed: ${relaunchErr.message}`);
+        }
+      }
     }
 
     if (i < task.repetitions && runningTasks.get(task.id)) {
@@ -233,12 +271,13 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
     let currentUrl = "";
     try { currentUrl = page.url(); } catch (_e) { currentUrl = "redirected"; }
 
+    page.removeAllListeners();
     await page.close();
 
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
     return { ip: proxyLabel, message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Proxy: ${proxyLabel} - Final: ${currentUrl}` };
   } catch (error: any) {
-    try { await page.close(); } catch (_) {}
+    try { page.removeAllListeners(); await page.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
       return { ip: proxyLabel, message: `Run #${runNumber} - VOTED (redirected) - Proxy: ${proxyLabel}` };
     }
