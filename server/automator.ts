@@ -57,7 +57,7 @@ async function fetchProxyList(proxyListUrl: string): Promise<string[]> {
     const text = await res.text();
     const lines = text.trim().split("\n").filter(l => l.trim().length > 0);
     if (lines.length > 0) {
-      const shuffled = lines.sort(() => Math.random() - 0.5).slice(0, 1000);
+      const shuffled = lines.sort(() => Math.random() - 0.5).slice(0, 300);
       cachedProxies = shuffled;
       proxyFetchTime = now;
       console.log(`[Proxy] Fetched ${lines.length} proxies, using ${shuffled.length}`);
@@ -168,6 +168,16 @@ export async function executeTask(task: Task) {
 
     if (i > 1 && i % 5 === 1) {
       console.log("[Recycle] Restarting browser to free memory...");
+      try { await browser.close(); } catch {}
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
+    }
+
+    const mem = process.memoryUsage().rss / 1024 / 1024;
+    if (mem > 1500) {
+      console.log(`[Memory Guard] High memory (${Math.round(mem)}MB), recycling browser...`);
       try { await browser.close(); } catch {}
       const relaunched = await createBrowser(proxies);
       browser = relaunched.browser;
