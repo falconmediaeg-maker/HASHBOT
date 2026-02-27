@@ -163,21 +163,21 @@ async function performBrowserRun(task: Task, runNumber: number): Promise<{ ip?: 
     `--user-agent=${ua}`,
   ];
 
-let proxyAuth: ...
-let proxyLabel = "direct";
+  let proxyAuth: { username: string; password: string } | null = null;
+  let proxyLabel = "direct";
 
-const webshareUrl = process.env.WEBSHARE_PROXY_URL;
-if (webshareUrl) {
-  const proxies = await fetchProxyList(webshareUrl);
-  if (proxies.length > 0) {
-    const p = parseProxyLine(proxies[Math.floor(Math.random() * proxies.length)]);
-    args.push(`--proxy-server=http://${p.host}:${p.port}`);
-    proxyAuth = { username: p.user, password: p.pass };
-    proxyLabel = `${p.host}:${p.port}`;
+  const webshareUrl = process.env.WEBSHARE_PROXY_URL;
+  if (webshareUrl) {
+    const proxies = await fetchProxyList(webshareUrl);
+    if (proxies.length > 0) {
+      const p = parseProxyLine(proxies[Math.floor(Math.random() * proxies.length)]);
+      args.push(`--proxy-server=http://${p.host}:${p.port}`);
+      proxyAuth = { username: p.user, password: p.pass };
+      proxyLabel = `${p.host}:${p.port}`;
+    }
   }
-}
 
-let browser;
+  let browser;
   try {
     browser = await puppeteer.launch({
       executablePath: CHROMIUM_PATH,
