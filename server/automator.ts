@@ -45,7 +45,7 @@ async function fetchProxyList(proxyListUrl: string): Promise<string[]> {
   }
   try {
     console.log(`[Proxy] Fetching proxy list...`);
-    const controller = new AbortController();
+    const controller = new globalThis.AbortController();
     const tid = setTimeout(() => controller.abort(), 15000);
     const res = await fetch(proxyListUrl, { signal: controller.signal });
     clearTimeout(tid);
