@@ -342,7 +342,7 @@ function buildCssSelector(htmlOrSelector: string): string | null {
 
   if (tagMatch && nameMatch) {
     let sel = `${tagMatch[1]}[name="${nameMatch[1]}"]`;
-    if (valueValue) sel += `[value="${valueMatch[1]}"]`;
+    if (valueMatch) sel += `[value="${valueMatch[1]}"]`;
     if (typeMatch) sel += `[type="${typeMatch[1]}"]`;
     return sel;
   }
