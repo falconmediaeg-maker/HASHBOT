@@ -1,11 +1,15 @@
 [phases.setup]
-nixPkgs = ["nodejs_22", "chromium", "nss", "freetype", "harfbuzz", "ca-certificates", "ttf-opensans", "glib", "nspr", "at-spi2-atk", "cups", "libdrm", "expat", "libxcb", "libxkbcommon", "mesa", "libGL"]
+nixPkgs = ["nodejs_22", "chromium", "nss", "freetype", "harfbuzz", "ca-certificates", "glib", "nspr", "at-spi2-atk", "cups", "libdrm", "expat", "libxcb", "libxkbcommon", "mesa"]
 
 [phases.install]
 cmds = ["npm ci"]
 
 [phases.build]
 cmds = ["npm run build"]
+
+[variables]
+PUPPETEER_SKIP_DOWNLOAD = "true"
+CHROMIUM_FLAGS = "--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --single-process --no-zygote"
 
 [start]
 cmd = "npm start"
