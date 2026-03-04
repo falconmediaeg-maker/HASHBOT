@@ -66,32 +66,50 @@ async function fetchProxyList(): Promise<void> {
 
   const url = process.env.WEBSHARE_PROXY_URL;
   if (!url) return;
-  console.log("[Proxy] Fetching proxy list...");
+  console.log("[Proxy] Fetching proxy list from URL...");
   return new Promise((resolve) => {
     const mod = url.startsWith("https") ? https : http;
-    mod.get(url, (res) => {
+    const req = mod.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
+      console.log(`[Proxy] HTTP status: ${res.statusCode}`);
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        const location = res.headers.location;
+        console.log(`[Proxy] Redirect to: ${location}`);
+        if (location) {
+          const redMod = location.startsWith("https") ? https : http;
+          redMod.get(location, { headers: { "User-Agent": "Mozilla/5.0" } }, (res2) => {
+            let data = "";
+            res2.on("data", (chunk) => (data += chunk));
+            res2.on("end", () => parseProxyData(data, resolve));
+          }).on("error", (e) => { console.log(`[Proxy] Redirect error: ${e.message}`); resolve(); });
+        } else { resolve(); }
+        return;
+      }
       let data = "";
       res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        const lines = data.trim().split("\n").filter(Boolean);
-        const parsed: ProxyInfo[] = [];
-        for (const line of lines) {
-          const parts = line.trim().split(":");
-          if (parts.length >= 4) {
-            parsed.push({ host: parts[0], port: parts[1], user: parts[2], pass: parts[3] });
-          }
-        }
-        if (parsed.length > 0) {
-          proxyList = parsed.slice(0, 500);
-          console.log(`[Proxy] Fetched ${parsed.length} proxies, using ${proxyList.length}`);
-        } else {
-          console.log("[Proxy] No valid proxies parsed from list");
-        }
-        resolve();
-      });
-      res.on("error", () => resolve());
-    }).on("error", () => resolve());
+      res.on("end", () => parseProxyData(data, resolve));
+      res.on("error", (e) => { console.log(`[Proxy] Response error: ${e.message}`); resolve(); });
+    });
+    req.on("error", (e) => { console.log(`[Proxy] Request error: ${e.message}`); resolve(); });
   });
+}
+
+function parseProxyData(data: string, resolve: () => void): void {
+  console.log(`[Proxy] Raw response (first 200 chars): ${data.slice(0, 200)}`);
+  const lines = data.trim().split("\n").filter(Boolean);
+  const parsed: ProxyInfo[] = [];
+  for (const line of lines) {
+    const parts = line.trim().split(":");
+    if (parts.length >= 4) {
+      parsed.push({ host: parts[0], port: parts[1], user: parts[2], pass: parts[3] });
+    }
+  }
+  if (parsed.length > 0) {
+    proxyList = parsed.slice(0, 500);
+    console.log(`[Proxy] Fetched ${parsed.length} proxies, using ${proxyList.length}`);
+  } else {
+    console.log(`[Proxy] No valid proxies parsed. Lines count: ${lines.length}`);
+  }
+  resolve();
 }
 
 function getNextProxy(): ProxyInfo | null {
@@ -124,7 +142,7 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
 
 async function createBrowser(proxy?: ProxyInfo): Promise<any> {
   const args = buildBrowserArgs(proxy);
-  const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: "new" as any, args });
+  const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
   activeBrowser = browser;
   const label = proxy ? `${proxy.host}:${proxy.port}` : "direct";
   console.log(`[Task] Browser launched with proxy: ${label}`);
@@ -318,7 +336,7 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
     const cfStatus = await page.evaluate(() => {
       const text = document.body?.innerText || "";
       const html = document.body?.innerHTML || "";
-      if (html.includes("cf-wrapper") && text.includes("you have been blocked")) return "hard_block";
+      if (text.includes("you have been blocked") || text.includes("unable to access")) return "hard_block";
       if (text.includes("enable cookies") || text.includes("Enable Cookies")) return "cookie_block";
       if (text.includes("Performing security verification") || text.includes("security service") || text.includes("checking your browser")) return "challenge";
       return "ok";
@@ -339,7 +357,7 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       const afterChallenge = await page.evaluate(() => {
         const text = document.body?.innerText || "";
         const html = document.body?.innerHTML || "";
-        if (html.includes("cf-wrapper") && text.includes("you have been blocked")) return "hard_block";
+        if (text.includes("you have been blocked") || text.includes("unable to access")) return "hard_block";
         if (text.includes("enable cookies")) return "cookie_block";
         if (text.includes("Performing security verification") || text.includes("security service")) return "challenge";
         return "ok";
@@ -407,7 +425,11 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
     await page.close();
 
     const textOneLine = pageText.replace(/\s+/g, " ").trim();
-    console.log(`[Vote] Run #${runNumber} URL=${currentUrl} | TEXT=${textOneLine}`);
+    console.log(`[Vote] Run #${runNumber} URL=${currentUrl} | TEXT=${textOneLine.slice(0, 150)}`);
+
+    if (textOneLine.includes("you have been blocked") || textOneLine.includes("unable to access")) {
+      throw new Error(`WAF block after vote - IP blocked`);
+    }
 
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
     return { message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - URL:${currentUrl} - ${textOneLine.slice(0, 120)}` };
