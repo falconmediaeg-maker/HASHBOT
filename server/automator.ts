@@ -1,8 +1,9 @@
-import puppeteer from "puppeteer-core";
+import puppeteerExtra from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+puppeteerExtra.use(StealthPlugin());
 import { storage } from "./storage";
 import type { Task, Action } from "@shared/schema";
 import { execSync } from "child_process";
-import os from "os";
 import https from "https";
 import http from "http";
 
@@ -52,6 +53,7 @@ interface ProxyInfo {
 
 let proxyList: ProxyInfo[] = [];
 let proxyIndex = 0;
+let browserRestartCount = 0;
 
 async function fetchProxyList(): Promise<void> {
   const directHost = process.env.PROXY_HOST;
@@ -90,15 +92,14 @@ async function fetchProxyList(): Promise<void> {
         resolve();
       });
       res.on("error", () => resolve());
-    }).on("error", () => resolve());
+    }).on("error", () => resolve()).setTimeout(10000, function() { this.destroy(); resolve(); });
   });
 }
 
 function getNextProxy(): ProxyInfo | null {
   if (proxyList.length === 0) return null;
-  const proxy = proxyList[proxyIndex % proxyList.length];
-  proxyIndex++;
-  return proxy;
+  proxyIndex = (proxyIndex + 1) % proxyList.length;
+  return proxyList[proxyIndex];
 }
 
 function buildBrowserArgs(proxy?: ProxyInfo): string[] {
@@ -108,7 +109,6 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--disable-software-rasterizer",
-    "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
     "--no-zygote",
     "--disable-extensions",
@@ -131,7 +131,6 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
     "--disable-crash-reporter",
     "--disable-oor-cors",
     "--js-flags=--max-old-space-size=128",
-    "--window-size=1366,768",
   ];
   if (proxy) {
     args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
@@ -143,19 +142,19 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
 
 async function createBrowser(proxy?: ProxyInfo): Promise<any> {
   const args = buildBrowserArgs(proxy);
-  const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
+  const browser = await puppeteerExtra.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
   activeBrowser = browser;
+  browserRestartCount++;
   const label = proxy ? `${proxy.host}:${proxy.port}` : "direct";
-  console.log(`[Task] Browser launched with proxy: ${label}`);
+  console.log(`[Task] Browser launched with proxy: ${label} (total restarts: ${browserRestartCount})`);
   return browser;
 }
 
 function isHighMemory(): boolean {
   const rss = process.memoryUsage().rss;
-  const total = os.totalmem();
-  const pct = (rss / total) * 100;
-  if (pct > 60) {
-    console.log(`[Memory Guard] ${Math.round(pct)}% RAM used, recycling browser...`);
+  const limitBytes = 800 * 1024 * 1024;
+  if (rss > limitBytes) {
+    console.log(`[Memory Guard] RSS=${Math.round(rss / 1024 / 1024)}MB exceeded 800MB limit, recycling browser...`);
     return true;
   }
   return false;
@@ -215,7 +214,7 @@ export async function executeTask(task: Task) {
       const result = await Promise.race([
         performPageVote(browser, task, i, currentProxy || undefined),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)
+          setTimeout(() => reject(new Error("Run timeout after 120s")), 120000)
         ),
       ]);
       consecutiveFailures = 0;
@@ -249,7 +248,7 @@ export async function executeTask(task: Task) {
     }
 
     if (i < task.repetitions && runningTasks.get(task.id)) {
-      await delay(Math.max(task.delayMs, 7000));
+      await delay(7000 + Math.random() * 4000);
     }
   }
 
@@ -263,8 +262,15 @@ export async function executeTask(task: Task) {
 async function performPageVote(browser: any, task: Task, runNumber: number, proxy?: ProxyInfo): Promise<{ message: string }> {
   const page = await browser.newPage();
 
+  await page.setUserAgent(getRandomUserAgent());
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9,ar;q=0.8" });
+
   if (proxy) {
-    await page.authenticate({ username: proxy.user, password: proxy.pass });
+    const sessionId = Math.random().toString(36).substring(2, 12);
+    const username = proxy.user.includes("-session-")
+      ? proxy.user.replace(/-session-[^-]+$/, `-session-${sessionId}`)
+      : `${proxy.user}-session-${sessionId}`;
+    await page.authenticate({ username, password: proxy.pass });
   }
 
   try {
@@ -276,22 +282,29 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       storageTypes: "all",
     });
 
-    await page.setViewport({ width: 1366, height: 768 });
+    await page.setViewport({
+      width: 1200 + Math.floor(Math.random() * 200),
+      height: 700 + Math.floor(Math.random() * 200),
+    });
+    await page.emulateTimezone("UTC");
 
-    await page.setRequestInterception(true);
-    page.on("request", (req: any) => {
-      const type = req.resourceType();
-      if (["image", "font", "media"].includes(type)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
+    page.on("close", () => { try { page.removeAllListeners(); } catch (_) {} });
+
+    await client.send("Network.enable");
+    await client.send("Network.setBlockedURLs", {
+      urls: [
+        "*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.svg", "*.ico", "*.bmp",
+        "*.woff", "*.woff2", "*.ttf", "*.eot",
+        "*.mp4", "*.mp3", "*.avi", "*.webm", "*.ogg",
+      ],
     });
 
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
       Object.defineProperty(navigator, "languages", { get: () => ["ar-EG", "ar", "en-US", "en"] });
       Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
+      Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
       (window as any).chrome = { runtime: {} };
     });
 
