@@ -72,8 +72,8 @@ async function fetchProxyList(): Promise<void> {
           }
         }
         if (parsed.length > 0) {
-          proxyList = parsed;
-          console.log(`[Proxy] Fetched ${parsed.length} proxies, using ${parsed.length}`);
+          proxyList = parsed.slice(0, 500);
+          console.log(`[Proxy] Fetched ${parsed.length} proxies, using ${proxyList.length}`);
         } else {
           console.log("[Proxy] No valid proxies parsed from list");
         }
@@ -298,6 +298,13 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       sessionStorage.clear();
     });
 
+    const cfCheck = await page.evaluate(() => document.body?.innerText?.includes("Performing security verification") || document.body?.innerText?.includes("security service") || false);
+    if (cfCheck) {
+      console.log(`[CF] Cloudflare challenge detected, waiting 12s for auto-resolve...`);
+      await delay(12000);
+      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch (_) {}
+    }
+
     await delay(3000 + Math.random() * 2000);
 
     for (const action of task.actions) {
@@ -319,6 +326,14 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
     try {
       pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || "");
     } catch (_e) {}
+
+    if (pageText.includes("security verification") || pageText.includes("Cloudflare")) {
+      console.log(`[CF] Cloudflare challenge detected after vote, waiting 12s for auto-resolve...`);
+      await delay(12000);
+      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch (_) {}
+      try { currentUrl = page.url(); } catch (_e) {}
+      try { pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || ""); } catch (_e) {}
+    }
 
     page.removeAllListeners();
     await page.close();
