@@ -1,11 +1,8 @@
-import puppeteerExtra from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
-puppeteerExtra.use(StealthPlugin());
+import puppeteer from "puppeteer-core";
 import { storage } from "./storage";
 import type { Task, Action } from "@shared/schema";
 import { execSync } from "child_process";
-import https from "https";
-import http from "http";
+import os from "os";
 
 function findChromium(): string {
   const candidates = [
@@ -24,7 +21,10 @@ function findChromium(): string {
 }
 
 const CHROMIUM_PATH = findChromium();
+
 const runningTasks = new Map<string, boolean>();
+let cachedProxies: string[] = [];
+let proxyFetchTime = 0;
 let activeBrowser: any = null;
 
 process.on("SIGTERM", async () => {
@@ -44,71 +44,45 @@ export function stopTask(taskId: string) {
   runningTasks.set(taskId, false);
 }
 
-interface ProxyInfo {
-  host: string;
-  port: string;
-  user: string;
-  pass: string;
-}
-
-let proxyList: ProxyInfo[] = [];
-let proxyIndex = 0;
-let browserRestartCount = 0;
-
-async function fetchProxyList(): Promise<void> {
-  const directHost = process.env.PROXY_HOST;
-  const directPort = process.env.PROXY_PORT;
-  const directUser = process.env.PROXY_USER;
-  const directPass = process.env.PROXY_PASS;
-  if (directHost && directPort && directUser && directPass) {
-    proxyList = [{ host: directHost, port: directPort, user: directUser, pass: directPass }];
-    console.log(`[Proxy] Using direct proxy: ${directHost}:${directPort}`);
-    return;
+async function fetchProxyList(proxyListUrl: string): Promise<string[]> {
+  const now = Date.now();
+  if (cachedProxies.length > 0 && now - proxyFetchTime < 10 * 60 * 1000) {
+    return cachedProxies;
   }
-
-  const url = process.env.WEBSHARE_PROXY_URL;
-  if (!url) return;
-  console.log("[Proxy] Fetching proxy list...");
-  return new Promise((resolve) => {
-    const mod = url.startsWith("https") ? https : http;
-    mod.get(url, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        const lines = data.trim().split("\n").filter(Boolean);
-        const parsed: ProxyInfo[] = [];
-        for (const line of lines) {
-          const parts = line.trim().split(":");
-          if (parts.length >= 4) {
-            parsed.push({ host: parts[0], port: parts[1], user: parts[2], pass: parts[3] });
-          }
-        }
-        if (parsed.length > 0) {
-          proxyList = parsed.slice(0, 500);
-          console.log(`[Proxy] Fetched ${parsed.length} proxies, using ${proxyList.length}`);
-        } else {
-          console.log("[Proxy] No valid proxies parsed from list");
-        }
-        resolve();
-      });
-      res.on("error", () => resolve());
-    }).on("error", () => resolve()).setTimeout(10000, function() { this.destroy(); resolve(); });
-  });
+  try {
+    console.log(`[Proxy] Fetching proxy list...`);
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(proxyListUrl, { signal: controller.signal });
+    clearTimeout(tid);
+    const text = await res.text();
+    const lines = text.trim().split("\n").filter(l => l.trim().length > 0);
+    if (lines.length > 0) {
+      const shuffled = lines.sort(() => Math.random() - 0.5).slice(0, 300);
+      cachedProxies = shuffled;
+      proxyFetchTime = now;
+      console.log(`[Proxy] Fetched ${lines.length} proxies, using ${shuffled.length}`);
+    }
+    return cachedProxies;
+  } catch (e: any) {
+    console.log(`[Proxy] Fetch failed: ${e.message} - continuing without proxies`);
+    return [];
+  }
 }
 
-function getNextProxy(): ProxyInfo | null {
-  if (proxyList.length === 0) return null;
-  proxyIndex = (proxyIndex + 1) % proxyList.length;
-  return proxyList[proxyIndex];
+function parseProxyLine(line: string): { host: string; port: string; user: string; pass: string } {
+  const parts = line.trim().split(":");
+  return { host: parts[0], port: parts[1], user: parts[2], pass: parts[3] };
 }
 
-function buildBrowserArgs(proxy?: ProxyInfo): string[] {
+function buildBrowserArgs(proxyHost?: string, ua?: string): string[] {
   const args = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--disable-software-rasterizer",
+    "--disable-blink-features=AutomationControlled",
     "--disable-infobars",
     "--no-zygote",
     "--disable-extensions",
@@ -131,30 +105,45 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
     "--disable-crash-reporter",
     "--disable-oor-cors",
     "--js-flags=--max-old-space-size=128",
+    "--window-size=1366,768",
   ];
-  if (proxy) {
-    args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
-    args.push("--ignore-certificate-errors");
-    args.push("--ignore-certificate-errors-spki-list");
-  }
+  if (ua) args.push(`--user-agent=${ua}`);
+  if (proxyHost) args.push(`--proxy-server=${proxyHost}`);
   return args;
 }
 
-async function createBrowser(proxy?: ProxyInfo): Promise<any> {
-  const args = buildBrowserArgs(proxy);
-  const browser = await puppeteerExtra.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
-  activeBrowser = browser;
-  browserRestartCount++;
-  const label = proxy ? `${proxy.host}:${proxy.port}` : "direct";
-  console.log(`[Task] Browser launched with proxy: ${label} (total restarts: ${browserRestartCount})`);
-  return browser;
+async function launchBrowser(proxies: string[]): Promise<{ browser: any; proxyAuth: { username: string; password: string } | null; proxyLabel: string }> {
+  let proxyAuth: { username: string; password: string } | null = null;
+  let proxyLabel = "direct";
+  let proxyHost: string | undefined;
+
+  if (proxies.length > 0) {
+    const p = parseProxyLine(proxies[Math.floor(Math.random() * proxies.length)]);
+    proxyHost = `http://${p.host}:${p.port}`;
+    proxyAuth = { username: p.user, password: p.pass };
+    proxyLabel = `${p.host}:${p.port}`;
+  }
+
+  const ua = getRandomUserAgent();
+  const args = buildBrowserArgs(proxyHost, ua);
+
+  const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
+  return { browser, proxyAuth, proxyLabel };
+}
+
+async function createBrowser(proxies: string[]): Promise<{ browser: any; proxyAuth: { username: string; password: string } | null; proxyLabel: string }> {
+  const launched = await launchBrowser(proxies);
+  activeBrowser = launched.browser;
+  console.log(`[Task] Browser launched with proxy: ${launched.proxyLabel}`);
+  return launched;
 }
 
 function isHighMemory(): boolean {
   const rss = process.memoryUsage().rss;
-  const limitBytes = 800 * 1024 * 1024;
-  if (rss > limitBytes) {
-    console.log(`[Memory Guard] RSS=${Math.round(rss / 1024 / 1024)}MB exceeded 800MB limit, recycling browser...`);
+  const total = os.totalmem();
+  const pct = (rss / total) * 100;
+  if (pct > 60) {
+    console.log(`[Memory Guard] ${Math.round(pct)}% RAM used (${Math.round(rss / 1024 / 1024)}MB / ${Math.round(total / 1024 / 1024)}MB), recycling browser...`);
     return true;
   }
   return false;
@@ -167,10 +156,11 @@ export async function executeTask(task: Task) {
   await storage.updateTask(task.id, { status: "running", completedRuns: 0, failedRuns: 0 });
   console.log(`[Task] Starting ${task.repetitions} runs`);
 
-  await fetchProxyList();
+  const webshareUrl = process.env.WEBSHARE_PROXY_URL;
+  let proxies: string[] = [];
+  if (webshareUrl) proxies = await fetchProxyList(webshareUrl);
 
-  let currentProxy = getNextProxy();
-  let browser = await createBrowser(currentProxy || undefined);
+  let { browser, proxyAuth, proxyLabel } = await createBrowser(proxies);
   let consecutiveFailures = 0;
 
   for (let i = 1; i <= task.repetitions; i++) {
@@ -183,45 +173,51 @@ export async function executeTask(task: Task) {
     if (!browser || !browser.isConnected()) {
       console.log("[Recovery] Browser disconnected, relaunching...");
       try { await browser?.close(); } catch {}
-      currentProxy = getNextProxy();
-      browser = await createBrowser(currentProxy || undefined);
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
     }
 
     if (i > 1 && i % 5 === 1) {
       console.log("[Recycle] Restarting browser to free memory...");
       try { await browser.close(); } catch {}
-      currentProxy = getNextProxy();
-      browser = await createBrowser(currentProxy || undefined);
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
     }
 
     if (i > 1 && i % 200 === 1) {
       console.log("[Batch] 200-run batch complete, pausing 30s...");
       try { await browser.close(); } catch {}
       await delay(30000);
-      currentProxy = getNextProxy();
-      browser = await createBrowser(currentProxy || undefined);
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
     }
 
     if (isHighMemory()) {
       try { await browser.close(); } catch {}
-      currentProxy = getNextProxy();
-      browser = await createBrowser(currentProxy || undefined);
+      const relaunched = await createBrowser(proxies);
+      browser = relaunched.browser;
+      proxyAuth = relaunched.proxyAuth;
+      proxyLabel = relaunched.proxyLabel;
     }
-
-    const proxyLabel = currentProxy ? `${currentProxy.host}:${currentProxy.port}` : "direct";
 
     try {
       const result = await Promise.race([
-        performPageVote(browser, task, i, currentProxy || undefined),
+        performPageVote(browser, proxyAuth, proxyLabel, task, i),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Run timeout after 120s")), 120000)
+          setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)
         ),
       ]);
       consecutiveFailures = 0;
       const currentTask = await storage.getTask(task.id);
       if (currentTask) await storage.updateTask(task.id, { completedRuns: (currentTask.completedRuns || 0) + 1 });
-      await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "success", ipUsed: proxyLabel, message: result.message });
-      console.log(`[Task] Run ${i}/${task.repetitions} SUCCESS - ${proxyLabel}`);
+      await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "success", ipUsed: result.ip || "direct", message: result.message });
+      console.log(`[Task] Run ${i}/${task.repetitions} SUCCESS - ${result.ip || "direct"}`);
     } catch (error: any) {
       consecutiveFailures++;
       const currentTask = await storage.getTask(task.id);
@@ -239,8 +235,10 @@ export async function executeTask(task: Task) {
         console.log("[Recovery] Critical error, relaunching browser...");
         try { await browser.close(); } catch {}
         try {
-          currentProxy = getNextProxy();
-          browser = await createBrowser(currentProxy || undefined);
+          const relaunched = await createBrowser(proxies);
+          browser = relaunched.browser;
+          proxyAuth = relaunched.proxyAuth;
+          proxyLabel = relaunched.proxyLabel;
         } catch (relaunchErr: any) {
           console.log(`[Recovery] Relaunch failed: ${relaunchErr.message}`);
         }
@@ -248,7 +246,7 @@ export async function executeTask(task: Task) {
     }
 
     if (i < task.repetitions && runningTasks.get(task.id)) {
-      await delay(7000 + Math.random() * 4000);
+      await delay(Math.max(task.delayMs, 2000));
     }
   }
 
@@ -259,80 +257,43 @@ export async function executeTask(task: Task) {
   console.log(`[Task] Finished`);
 }
 
-async function performPageVote(browser: any, task: Task, runNumber: number, proxy?: ProxyInfo): Promise<{ message: string }> {
+async function performPageVote(browser: any, proxyAuth: { username: string; password: string } | null, proxyLabel: string, task: Task, runNumber: number): Promise<{ ip?: string; message: string }> {
   const page = await browser.newPage();
 
-  await page.setUserAgent(getRandomUserAgent());
-  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9,ar;q=0.8" });
-
-  if (proxy) {
-    const sessionId = Math.random().toString(36).substring(2, 12);
-    const username = proxy.user.includes("-session-")
-      ? proxy.user.replace(/-session-[^-]+$/, `-session-${sessionId}`)
-      : `${proxy.user}-session-${sessionId}`;
-    await page.authenticate({ username, password: proxy.pass });
-  }
-
   try {
+    if (proxyAuth) await page.authenticate(proxyAuth);
+
     const client = await page.target().createCDPSession();
     await client.send("Network.clearBrowserCookies");
     await client.send("Network.clearBrowserCache");
-    await client.send("Storage.clearDataForOrigin", {
-      origin: new URL(task.targetUrl).origin,
-      storageTypes: "all",
-    });
 
-    await page.setViewport({
-      width: 1200 + Math.floor(Math.random() * 200),
-      height: 700 + Math.floor(Math.random() * 200),
-    });
-    await page.emulateTimezone("UTC");
+    await page.setViewport({ width: 1366, height: 768 });
 
-    page.on("close", () => { try { page.removeAllListeners(); } catch (_) {} });
-
-    await client.send("Network.enable");
-    await client.send("Network.setBlockedURLs", {
-      urls: [
-        "*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.svg", "*.ico", "*.bmp",
-        "*.woff", "*.woff2", "*.ttf", "*.eot",
-        "*.mp4", "*.mp3", "*.avi", "*.webm", "*.ogg",
-      ],
+    await page.setRequestInterception(true);
+    page.on("request", (req: any) => {
+      const type = req.resourceType();
+      if (["image", "stylesheet", "font", "media", "other"].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
       Object.defineProperty(navigator, "languages", { get: () => ["ar-EG", "ar", "en-US", "en"] });
       Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
-      Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
       (window as any).chrome = { runtime: {} };
     });
 
-    await page.evaluateOnNewDocument(() => {
-      localStorage.clear();
-      sessionStorage.clear();
-    });
-
-    await page.goto(task.targetUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    await page.goto(task.targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
     const loadedUrl = page.url();
     if (loadedUrl.includes("chrome-error") || loadedUrl === "about:blank") {
       throw new Error(`Page failed to load: ${loadedUrl}`);
     }
 
-    await page.evaluate(() => {
-      localStorage.clear();
-      sessionStorage.clear();
-    });
-
-    const cfCheck = await page.evaluate(() => document.body?.innerText?.includes("Performing security verification") || document.body?.innerText?.includes("security service") || false);
-    if (cfCheck) {
-      console.log(`[CF] Cloudflare challenge detected, waiting 12s for auto-resolve...`);
-      await delay(12000);
-      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch (_) {}
-    }
-
-    await delay(3000 + Math.random() * 2000);
+    await delay(800 + Math.random() * 1200);
 
     for (const action of task.actions) {
       try {
@@ -344,36 +305,20 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       await delay(300 + Math.random() * 700);
     }
 
-    await delay(4000 + Math.random() * 2000);
+    await delay(1500 + Math.random() * 1500);
 
     let currentUrl = "";
     try { currentUrl = page.url(); } catch (_e) { currentUrl = "redirected"; }
 
-    let pageText = "";
-    try {
-      pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || "");
-    } catch (_e) {}
-
-    if (pageText.includes("security verification") || pageText.includes("Cloudflare")) {
-      console.log(`[CF] Cloudflare challenge detected after vote, waiting 12s for auto-resolve...`);
-      await delay(12000);
-      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch (_) {}
-      try { currentUrl = page.url(); } catch (_e) {}
-      try { pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || ""); } catch (_e) {}
-    }
-
     page.removeAllListeners();
     await page.close();
 
-    const textOneLine = pageText.replace(/\s+/g, " ").trim();
-    console.log(`[Vote] Run #${runNumber} URL=${currentUrl} | TEXT=${textOneLine}`);
-
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
-    return { message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - URL:${currentUrl} - ${textOneLine.slice(0, 120)}` };
+    return { ip: proxyLabel, message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Proxy: ${proxyLabel} - Final: ${currentUrl}` };
   } catch (error: any) {
     try { page.removeAllListeners(); await page.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
-      return { message: `Run #${runNumber} - VOTED (redirected)` };
+      return { ip: proxyLabel, message: `Run #${runNumber} - VOTED (redirected) - Proxy: ${proxyLabel}` };
     }
     throw error;
   }
