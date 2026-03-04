@@ -1,13 +1,10 @@
-import puppeteer from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import puppeteer from "puppeteer-core";
 import { storage } from "./storage";
 import type { Task, Action } from "@shared/schema";
 import { execSync } from "child_process";
 import os from "os";
 import https from "https";
 import http from "http";
-
-puppeteer.use(StealthPlugin());
 
 function findChromium(): string {
   const candidates = [
