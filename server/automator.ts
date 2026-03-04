@@ -1,10 +1,13 @@
-import puppeteer from "puppeteer-core";
+import puppeteer from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { storage } from "./storage";
 import type { Task, Action } from "@shared/schema";
 import { execSync } from "child_process";
 import os from "os";
 import https from "https";
 import http from "http";
+
+puppeteer.use(StealthPlugin());
 
 function findChromium(): string {
   const candidates = [
@@ -107,31 +110,12 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
-    "--disable-software-rasterizer",
     "--disable-blink-features=AutomationControlled",
-    "--disable-infobars",
-    "--no-zygote",
-    "--disable-extensions",
-    "--disable-background-networking",
-    "--disable-default-apps",
-    "--disable-sync",
-    "--disable-translate",
     "--no-first-run",
-    "--disable-features=site-per-process,TranslateUI",
     "--disable-ipc-flooding-protection",
-    "--disable-renderer-backgrounding",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-component-update",
-    "--disable-domain-reliability",
-    "--disable-print-preview",
-    "--disable-speech-api",
-    "--disable-hang-monitor",
-    "--disable-client-side-phishing-detection",
-    "--metrics-recording-only",
-    "--disable-crash-reporter",
-    "--disable-oor-cors",
     "--js-flags=--max-old-space-size=128",
     "--window-size=1366,768",
+    "--lang=ar-EG,ar,en-US,en",
   ];
   if (proxy) {
     args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
@@ -143,7 +127,7 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
 
 async function createBrowser(proxy?: ProxyInfo): Promise<any> {
   const args = buildBrowserArgs(proxy);
-  const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
+  const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: "new" as any, args });
   activeBrowser = browser;
   const label = proxy ? `${proxy.host}:${proxy.port}` : "direct";
   console.log(`[Task] Browser launched with proxy: ${label}`);
@@ -277,6 +261,7 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
     });
 
     await page.setViewport({ width: 1366, height: 768 });
+    await page.setUserAgent(getRandomUserAgent());
 
     await page.setRequestInterception(true);
     page.on("request", (req: any) => {
@@ -289,15 +274,36 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
     });
 
     await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
       Object.defineProperty(navigator, "languages", { get: () => ["ar-EG", "ar", "en-US", "en"] });
-      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-      (window as any).chrome = { runtime: {} };
-    });
-
-    await page.evaluateOnNewDocument(() => {
-      localStorage.clear();
-      sessionStorage.clear();
+      Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+      Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
+      Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
+      Object.defineProperty(navigator, "maxTouchPoints", { get: () => 0 });
+      Object.defineProperty(navigator, "plugins", {
+        get: () => {
+          const plugins = [
+            { name: "Chrome PDF Plugin", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+            { name: "Chrome PDF Viewer", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", description: "" },
+            { name: "Native Client", filename: "internal-nacl-plugin", description: "" },
+          ];
+          (plugins as any).item = (i: number) => plugins[i];
+          (plugins as any).namedItem = (name: string) => plugins.find((p) => p.name === name) || null;
+          (plugins as any).refresh = () => {};
+          return plugins;
+        },
+      });
+      (window as any).chrome = {
+        runtime: { connect: () => {}, sendMessage: () => {} },
+        loadTimes: () => ({}),
+        csi: () => ({}),
+        app: {},
+      };
+      const origQuery = window.navigator.permissions.query;
+      (window.navigator.permissions as any).query = (parameters: any) =>
+        parameters.name === "notifications"
+          ? Promise.resolve({ state: Notification.permission } as any)
+          : origQuery(parameters);
     });
 
     await page.goto(task.targetUrl, { waitUntil: "networkidle2", timeout: 30000 });
@@ -312,11 +318,41 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       sessionStorage.clear();
     });
 
-    const cfCheck = await page.evaluate(() => document.body?.innerText?.includes("Performing security verification") || document.body?.innerText?.includes("security service") || false);
-    if (cfCheck) {
-      console.log(`[CF] Cloudflare challenge detected, waiting 12s for auto-resolve...`);
-      await delay(12000);
-      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch (_) {}
+    const cfStatus = await page.evaluate(() => {
+      const text = document.body?.innerText || "";
+      const html = document.body?.innerHTML || "";
+      if (html.includes("cf-wrapper") && text.includes("you have been blocked")) return "hard_block";
+      if (text.includes("enable cookies") || text.includes("Enable Cookies")) return "cookie_block";
+      if (text.includes("Performing security verification") || text.includes("security service") || text.includes("checking your browser")) return "challenge";
+      return "ok";
+    });
+
+    if (cfStatus === "hard_block" || cfStatus === "cookie_block") {
+      console.log(`[CF] Hard block detected (${cfStatus}), proxy is banned - skipping run`);
+      page.removeAllListeners();
+      await page.close();
+      throw new Error(`Cloudflare hard block (${cfStatus}) - proxy banned`);
+    }
+
+    if (cfStatus === "challenge") {
+      console.log(`[CF] JS challenge detected, waiting 25s for auto-resolve...`);
+      await delay(8000);
+      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20000 }); } catch (_) {}
+      await delay(3000);
+      const afterChallenge = await page.evaluate(() => {
+        const text = document.body?.innerText || "";
+        const html = document.body?.innerHTML || "";
+        if (html.includes("cf-wrapper") && text.includes("you have been blocked")) return "hard_block";
+        if (text.includes("enable cookies")) return "cookie_block";
+        if (text.includes("Performing security verification") || text.includes("security service")) return "challenge";
+        return "ok";
+      });
+      console.log(`[CF] After wait status: ${afterChallenge}`);
+      if (afterChallenge !== "ok") {
+        page.removeAllListeners();
+        await page.close();
+        throw new Error(`Cloudflare challenge not resolved (${afterChallenge})`);
+      }
     }
 
     await delay(3000 + Math.random() * 2000);
