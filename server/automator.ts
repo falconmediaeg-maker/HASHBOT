@@ -133,7 +133,7 @@ async function createBrowser(proxy?: ProxyInfo): Promise<any> {
   activeBrowser = browser;
   const label = proxy ? `${proxy.host}:${proxy.port}` : "direct";
   console.log(`[Task] Browser launched with proxy: ${label}`);
-  return { browser, proxy };
+  return browser;
 }
 
 function isHighMemory(): boolean {
@@ -156,8 +156,8 @@ export async function executeTask(task: Task) {
 
   await fetchProxyList();
 
-  let proxy = getNextProxy();
-  let { browser } = await createBrowser(proxy || undefined);
+  let currentProxy = getNextProxy();
+  let browser = await createBrowser(currentProxy || undefined);
   let consecutiveFailures = 0;
 
   for (let i = 1; i <= task.repetitions; i++) {
@@ -170,40 +170,36 @@ export async function executeTask(task: Task) {
     if (!browser || !browser.isConnected()) {
       console.log("[Recovery] Browser disconnected, relaunching...");
       try { await browser?.close(); } catch {}
-      proxy = getNextProxy();
-      const launched = await createBrowser(proxy || undefined);
-      browser = launched.browser;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
 
     if (i > 1 && i % 5 === 1) {
       console.log("[Recycle] Restarting browser to free memory...");
       try { await browser.close(); } catch {}
-      proxy = getNextProxy();
-      const launched = await createBrowser(proxy || undefined);
-      browser = launched.browser;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
 
     if (i > 1 && i % 200 === 1) {
       console.log("[Batch] 200-run batch complete, pausing 30s...");
       try { await browser.close(); } catch {}
       await delay(30000);
-      proxy = getNextProxy();
-      const launched = await createBrowser(proxy || undefined);
-      browser = launched.browser;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
 
     if (isHighMemory()) {
       try { await browser.close(); } catch {}
-      proxy = getNextProxy();
-      const launched = await createBrowser(proxy || undefined);
-      browser = launched.browser;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
 
-    const proxyLabel = proxy ? `${proxy.host}:${proxy.port}` : "direct";
+    const proxyLabel = currentProxy ? `${currentProxy.host}:${currentProxy.port}` : "direct";
 
     try {
       const result = await Promise.race([
-        performPageVote(browser, task, i, proxy || undefined),
+        performPageVote(browser, task, i, currentProxy || undefined),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)
         ),
@@ -230,9 +226,8 @@ export async function executeTask(task: Task) {
         console.log("[Recovery] Critical error, relaunching browser...");
         try { await browser.close(); } catch {}
         try {
-          proxy = getNextProxy();
-          const launched = await createBrowser(proxy || undefined);
-          browser = launched.browser;
+          currentProxy = getNextProxy();
+          browser = await createBrowser(currentProxy || undefined);
         } catch (relaunchErr: any) {
           console.log(`[Recovery] Relaunch failed: ${relaunchErr.message}`);
         }
@@ -240,7 +235,7 @@ export async function executeTask(task: Task) {
     }
 
     if (i < task.repetitions && runningTasks.get(task.id)) {
-      await delay(Math.max(task.delayMs, 2000));
+      await delay(Math.max(task.delayMs, 7000));
     }
   }
 
@@ -291,7 +286,7 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       sessionStorage.clear();
     });
 
-    await page.goto(task.targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto(task.targetUrl, { waitUntil: "networkidle2", timeout: 30000 });
 
     const loadedUrl = page.url();
     if (loadedUrl.includes("chrome-error") || loadedUrl === "about:blank") {
@@ -303,7 +298,7 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       sessionStorage.clear();
     });
 
-    await delay(800 + Math.random() * 1200);
+    await delay(3000 + Math.random() * 2000);
 
     for (const action of task.actions) {
       try {
