@@ -3,6 +3,8 @@ import { storage } from "./storage";
 import type { Task, Action } from "@shared/schema";
 import { execSync } from "child_process";
 import os from "os";
+import https from "https";
+import http from "http";
 
 function findChromium(): string {
   const candidates = [
@@ -21,10 +23,7 @@ function findChromium(): string {
 }
 
 const CHROMIUM_PATH = findChromium();
-
 const runningTasks = new Map<string, boolean>();
-let cachedProxies: string[] = [];
-let proxyFetchTime = 0;
 let activeBrowser: any = null;
 
 process.on("SIGTERM", async () => {
@@ -44,38 +43,65 @@ export function stopTask(taskId: string) {
   runningTasks.set(taskId, false);
 }
 
-async function fetchProxyList(proxyListUrl: string): Promise<string[]> {
-  const now = Date.now();
-  if (cachedProxies.length > 0 && now - proxyFetchTime < 10 * 60 * 1000) {
-    return cachedProxies;
-  }
-  try {
-    console.log(`[Proxy] Fetching proxy list...`);
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 15000);
-    const res = await fetch(proxyListUrl, { signal: controller.signal });
-    clearTimeout(tid);
-    const text = await res.text();
-    const lines = text.trim().split("\n").filter(l => l.trim().length > 0);
-    if (lines.length > 0) {
-      const shuffled = lines.sort(() => Math.random() - 0.5).slice(0, 300);
-      cachedProxies = shuffled;
-      proxyFetchTime = now;
-      console.log(`[Proxy] Fetched ${lines.length} proxies, using ${shuffled.length}`);
-    }
-    return cachedProxies;
-  } catch (e: any) {
-    console.log(`[Proxy] Fetch failed: ${e.message} - continuing without proxies`);
-    return [];
-  }
+interface ProxyInfo {
+  host: string;
+  port: string;
+  user: string;
+  pass: string;
 }
 
-function parseProxyLine(line: string): { host: string; port: string; user: string; pass: string } {
-  const parts = line.trim().split(":");
-  return { host: parts[0], port: parts[1], user: parts[2], pass: parts[3] };
+let proxyList: ProxyInfo[] = [];
+let proxyIndex = 0;
+
+async function fetchProxyList(): Promise<void> {
+  const directHost = process.env.PROXY_HOST;
+  const directPort = process.env.PROXY_PORT;
+  const directUser = process.env.PROXY_USER;
+  const directPass = process.env.PROXY_PASS;
+  if (directHost && directPort && directUser && directPass) {
+    proxyList = [{ host: directHost, port: directPort, user: directUser, pass: directPass }];
+    console.log(`[Proxy] Using direct proxy: ${directHost}:${directPort}`);
+    return;
+  }
+
+  const url = process.env.WEBSHARE_PROXY_URL;
+  if (!url) return;
+  console.log("[Proxy] Fetching proxy list...");
+  return new Promise((resolve) => {
+    const mod = url.startsWith("https") ? https : http;
+    mod.get(url, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        const lines = data.trim().split("\n").filter(Boolean);
+        const parsed: ProxyInfo[] = [];
+        for (const line of lines) {
+          const parts = line.trim().split(":");
+          if (parts.length >= 4) {
+            parsed.push({ host: parts[0], port: parts[1], user: parts[2], pass: parts[3] });
+          }
+        }
+        if (parsed.length > 0) {
+          proxyList = parsed.slice(0, 500);
+          console.log(`[Proxy] Fetched ${parsed.length} proxies, using ${proxyList.length}`);
+        } else {
+          console.log("[Proxy] No valid proxies parsed from list");
+        }
+        resolve();
+      });
+      res.on("error", () => resolve());
+    }).on("error", () => resolve());
+  });
 }
 
-function buildBrowserArgs(proxyHost?: string, ua?: string): string[] {
+function getNextProxy(): ProxyInfo | null {
+  if (proxyList.length === 0) return null;
+  const proxy = proxyList[proxyIndex % proxyList.length];
+  proxyIndex++;
+  return proxy;
+}
+
+function buildBrowserArgs(proxy?: ProxyInfo): string[] {
   const args = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -107,35 +133,21 @@ function buildBrowserArgs(proxyHost?: string, ua?: string): string[] {
     "--js-flags=--max-old-space-size=128",
     "--window-size=1366,768",
   ];
-  if (ua) args.push(`--user-agent=${ua}`);
-  if (proxyHost) args.push(`--proxy-server=${proxyHost}`);
+  if (proxy) {
+    args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
+    args.push("--ignore-certificate-errors");
+    args.push("--ignore-certificate-errors-spki-list");
+  }
   return args;
 }
 
-async function launchBrowser(proxies: string[]): Promise<{ browser: any; proxyAuth: { username: string; password: string } | null; proxyLabel: string }> {
-  let proxyAuth: { username: string; password: string } | null = null;
-  let proxyLabel = "direct";
-  let proxyHost: string | undefined;
-
-  if (proxies.length > 0) {
-    const p = parseProxyLine(proxies[Math.floor(Math.random() * proxies.length)]);
-    proxyHost = `http://${p.host}:${p.port}`;
-    proxyAuth = { username: p.user, password: p.pass };
-    proxyLabel = `${p.host}:${p.port}`;
-  }
-
-  const ua = getRandomUserAgent();
-  const args = buildBrowserArgs(proxyHost, ua);
-
+async function createBrowser(proxy?: ProxyInfo): Promise<any> {
+  const args = buildBrowserArgs(proxy);
   const browser = await puppeteer.launch({ executablePath: CHROMIUM_PATH, headless: true, args });
-  return { browser, proxyAuth, proxyLabel };
-}
-
-async function createBrowser(proxies: string[]): Promise<{ browser: any; proxyAuth: { username: string; password: string } | null; proxyLabel: string }> {
-  const launched = await launchBrowser(proxies);
-  activeBrowser = launched.browser;
-  console.log(`[Task] Browser launched with proxy: ${launched.proxyLabel}`);
-  return launched;
+  activeBrowser = browser;
+  const label = proxy ? `${proxy.host}:${proxy.port}` : "direct";
+  console.log(`[Task] Browser launched with proxy: ${label}`);
+  return browser;
 }
 
 function isHighMemory(): boolean {
@@ -143,7 +155,7 @@ function isHighMemory(): boolean {
   const total = os.totalmem();
   const pct = (rss / total) * 100;
   if (pct > 60) {
-    console.log(`[Memory Guard] ${Math.round(pct)}% RAM used (${Math.round(rss / 1024 / 1024)}MB / ${Math.round(total / 1024 / 1024)}MB), recycling browser...`);
+    console.log(`[Memory Guard] ${Math.round(pct)}% RAM used, recycling browser...`);
     return true;
   }
   return false;
@@ -156,11 +168,10 @@ export async function executeTask(task: Task) {
   await storage.updateTask(task.id, { status: "running", completedRuns: 0, failedRuns: 0 });
   console.log(`[Task] Starting ${task.repetitions} runs`);
 
-  const webshareUrl = process.env.WEBSHARE_PROXY_URL;
-  let proxies: string[] = [];
-  if (webshareUrl) proxies = await fetchProxyList(webshareUrl);
+  await fetchProxyList();
 
-  let { browser, proxyAuth, proxyLabel } = await createBrowser(proxies);
+  let currentProxy = getNextProxy();
+  let browser = await createBrowser(currentProxy || undefined);
   let consecutiveFailures = 0;
 
   for (let i = 1; i <= task.repetitions; i++) {
@@ -173,42 +184,36 @@ export async function executeTask(task: Task) {
     if (!browser || !browser.isConnected()) {
       console.log("[Recovery] Browser disconnected, relaunching...");
       try { await browser?.close(); } catch {}
-      const relaunched = await createBrowser(proxies);
-      browser = relaunched.browser;
-      proxyAuth = relaunched.proxyAuth;
-      proxyLabel = relaunched.proxyLabel;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
 
     if (i > 1 && i % 5 === 1) {
       console.log("[Recycle] Restarting browser to free memory...");
       try { await browser.close(); } catch {}
-      const relaunched = await createBrowser(proxies);
-      browser = relaunched.browser;
-      proxyAuth = relaunched.proxyAuth;
-      proxyLabel = relaunched.proxyLabel;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
 
     if (i > 1 && i % 200 === 1) {
       console.log("[Batch] 200-run batch complete, pausing 30s...");
       try { await browser.close(); } catch {}
       await delay(30000);
-      const relaunched = await createBrowser(proxies);
-      browser = relaunched.browser;
-      proxyAuth = relaunched.proxyAuth;
-      proxyLabel = relaunched.proxyLabel;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
 
     if (isHighMemory()) {
       try { await browser.close(); } catch {}
-      const relaunched = await createBrowser(proxies);
-      browser = relaunched.browser;
-      proxyAuth = relaunched.proxyAuth;
-      proxyLabel = relaunched.proxyLabel;
+      currentProxy = getNextProxy();
+      browser = await createBrowser(currentProxy || undefined);
     }
+
+    const proxyLabel = currentProxy ? `${currentProxy.host}:${currentProxy.port}` : "direct";
 
     try {
       const result = await Promise.race([
-        performPageVote(browser, proxyAuth, proxyLabel, task, i),
+        performPageVote(browser, task, i, currentProxy || undefined),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)
         ),
@@ -216,8 +221,8 @@ export async function executeTask(task: Task) {
       consecutiveFailures = 0;
       const currentTask = await storage.getTask(task.id);
       if (currentTask) await storage.updateTask(task.id, { completedRuns: (currentTask.completedRuns || 0) + 1 });
-      await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "success", ipUsed: result.ip || "direct", message: result.message });
-      console.log(`[Task] Run ${i}/${task.repetitions} SUCCESS - ${result.ip || "direct"}`);
+      await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "success", ipUsed: proxyLabel, message: result.message });
+      console.log(`[Task] Run ${i}/${task.repetitions} SUCCESS - ${proxyLabel}`);
     } catch (error: any) {
       consecutiveFailures++;
       const currentTask = await storage.getTask(task.id);
@@ -235,10 +240,8 @@ export async function executeTask(task: Task) {
         console.log("[Recovery] Critical error, relaunching browser...");
         try { await browser.close(); } catch {}
         try {
-          const relaunched = await createBrowser(proxies);
-          browser = relaunched.browser;
-          proxyAuth = relaunched.proxyAuth;
-          proxyLabel = relaunched.proxyLabel;
+          currentProxy = getNextProxy();
+          browser = await createBrowser(currentProxy || undefined);
         } catch (relaunchErr: any) {
           console.log(`[Recovery] Relaunch failed: ${relaunchErr.message}`);
         }
@@ -246,7 +249,7 @@ export async function executeTask(task: Task) {
     }
 
     if (i < task.repetitions && runningTasks.get(task.id)) {
-      await delay(Math.max(task.delayMs, 2000));
+      await delay(Math.max(task.delayMs, 7000));
     }
   }
 
@@ -257,22 +260,28 @@ export async function executeTask(task: Task) {
   console.log(`[Task] Finished`);
 }
 
-async function performPageVote(browser: any, proxyAuth: { username: string; password: string } | null, proxyLabel: string, task: Task, runNumber: number): Promise<{ ip?: string; message: string }> {
+async function performPageVote(browser: any, task: Task, runNumber: number, proxy?: ProxyInfo): Promise<{ message: string }> {
   const page = await browser.newPage();
 
-  try {
-    if (proxyAuth) await page.authenticate(proxyAuth);
+  if (proxy) {
+    await page.authenticate({ username: proxy.user, password: proxy.pass });
+  }
 
+  try {
     const client = await page.target().createCDPSession();
     await client.send("Network.clearBrowserCookies");
     await client.send("Network.clearBrowserCache");
+    await client.send("Storage.clearDataForOrigin", {
+      origin: new URL(task.targetUrl).origin,
+      storageTypes: "all",
+    });
 
     await page.setViewport({ width: 1366, height: 768 });
 
     await page.setRequestInterception(true);
     page.on("request", (req: any) => {
       const type = req.resourceType();
-      if (["image", "stylesheet", "font", "media", "other"].includes(type)) {
+      if (["image", "font", "media"].includes(type)) {
         req.abort();
       } else {
         req.continue();
@@ -286,39 +295,93 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
       (window as any).chrome = { runtime: {} };
     });
 
-    await page.goto(task.targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.evaluateOnNewDocument(() => {
+      localStorage.clear();
+      sessionStorage.clear();
+    });
+
+    await page.goto(task.targetUrl, { waitUntil: "networkidle2", timeout: 30000 });
 
     const loadedUrl = page.url();
     if (loadedUrl.includes("chrome-error") || loadedUrl === "about:blank") {
       throw new Error(`Page failed to load: ${loadedUrl}`);
     }
 
-    await delay(800 + Math.random() * 1200);
+    await page.evaluate(() => {
+      localStorage.clear();
+      sessionStorage.clear();
+    });
+
+    const cfCheck = await page.evaluate(() => document.body?.innerText?.includes("Performing security verification") || document.body?.innerText?.includes("security service") || false);
+    if (cfCheck) {
+      console.log(`[CF] Cloudflare challenge detected, waiting 12s for auto-resolve...`);
+      await delay(12000);
+      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch (_) {}
+    }
+
+    await delay(3000 + Math.random() * 2000);
+
+    if (runNumber <= 3) {
+      try {
+        const debugText = await page.evaluate(() => document.body?.innerText?.slice(0, 600) || "");
+        const debugHtml = await page.evaluate(() => document.body?.innerHTML?.slice(0, 1000) || "");
+        console.log(`[Debug] Run #${runNumber} PRE-VOTE TEXT: ${debugText.replace(/\s+/g, " ").trim()}`);
+        console.log(`[Debug] Run #${runNumber} PRE-VOTE HTML: ${debugHtml.replace(/\s+/g, " ").trim()}`);
+        const checkboxFound = await page.evaluate(() => {
+          const els = Array.from(document.querySelectorAll("input[type='checkbox'], input[type='radio']"));
+          return els.map((el: any) => `name=${el.name} value=${el.value} type=${el.type} checked=${el.checked}`).join(" | ");
+        });
+        console.log(`[Debug] Run #${runNumber} INPUTS: ${checkboxFound}`);
+        const btnFound = await page.evaluate(() => {
+          const btn = document.querySelector("#btnSub, button[type='submit'], input[type='submit']") as HTMLElement | null;
+          return btn ? `found: ${btn.tagName} id=${(btn as any).id} text=${btn.innerText}` : "NOT FOUND";
+        });
+        console.log(`[Debug] Run #${runNumber} SUBMIT BTN: ${btnFound}`);
+      } catch (_e) {}
+    }
 
     for (const action of task.actions) {
       try {
         await executeAction(page, action);
+        console.log(`[Action] Run #${runNumber} ${action.type} OK: ${action.selector.slice(0, 60)}`);
       } catch (actionErr: any) {
+        console.log(`[Action] Run #${runNumber} ${action.type} ERR: ${actionErr.message}`);
         if (actionErr.message?.includes("detached") || actionErr.message?.includes("navigation")) break;
         throw actionErr;
       }
       await delay(300 + Math.random() * 700);
     }
 
-    await delay(1500 + Math.random() * 1500);
+    await delay(4000 + Math.random() * 2000);
 
     let currentUrl = "";
     try { currentUrl = page.url(); } catch (_e) { currentUrl = "redirected"; }
 
+    let pageText = "";
+    try {
+      pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || "");
+    } catch (_e) {}
+
+    if (pageText.includes("security verification") || pageText.includes("Cloudflare")) {
+      console.log(`[CF] Cloudflare challenge detected after vote, waiting 12s for auto-resolve...`);
+      await delay(12000);
+      try { await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15000 }); } catch (_) {}
+      try { currentUrl = page.url(); } catch (_e) {}
+      try { pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || ""); } catch (_e) {}
+    }
+
     page.removeAllListeners();
     await page.close();
 
+    const textOneLine = pageText.replace(/\s+/g, " ").trim();
+    console.log(`[Vote] Run #${runNumber} URL=${currentUrl} | TEXT=${textOneLine}`);
+
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
-    return { ip: proxyLabel, message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Proxy: ${proxyLabel} - Final: ${currentUrl}` };
+    return { message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - URL:${currentUrl} - ${textOneLine.slice(0, 120)}` };
   } catch (error: any) {
     try { page.removeAllListeners(); await page.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
-      return { ip: proxyLabel, message: `Run #${runNumber} - VOTED (redirected) - Proxy: ${proxyLabel}` };
+      return { message: `Run #${runNumber} - VOTED (redirected)` };
     }
     throw error;
   }
@@ -336,54 +399,73 @@ async function executeAction(page: any, action: Action): Promise<void> {
   const cssSelector = buildCssSelector(selector);
 
   if (action.type === "check") {
+    const nameMatch = selector.match(/name="([^"]+)"/);
+    const valueMatch = selector.match(/value="([^"]+)"/);
+    const name = nameMatch ? nameMatch[1] : null;
+    const value = valueMatch ? valueMatch[1] : null;
+
     if (cssSelector) {
       try {
         await page.waitForSelector(cssSelector, { timeout: 8000 });
-        await page.click(cssSelector);
+        await page.evaluate((sel: string) => {
+          const el = document.querySelector(sel) as HTMLElement;
+          if (el) { el.scrollIntoView({ block: "center" }); el.click(); }
+        }, cssSelector);
         return;
       } catch (e) {}
     }
-    const nameMatch = selector.match(/name="([^"]+)"/);
-    const valueMatch = selector.match(/value="([^"]+)"/);
-    if (nameMatch) {
-      const name = nameMatch[1];
-      const value = valueMatch ? valueMatch[1] : null;
-      let jsSelector: string;
-      if (value) {
-        jsSelector = `document.querySelector('input[name="${name}"][value="${value}"]')`;
-      } else {
-        jsSelector = `document.querySelector('input[name="${name}"]')`;
-      }
-      await page.evaluate((sel: string) => {
-        const el = eval(sel) as HTMLElement;
-        if (el) el.click();
-      }, jsSelector);
+
+    if (name) {
+      const result = await page.evaluate((n: string, v: string | null) => {
+        const selectors = [
+          v ? `input[name="${n}"][value="${v}"]` : null,
+          `input[name="${n}"]`,
+          `input[name="${n}"][type="radio"]`,
+          `input[name="${n}"][type="checkbox"]`,
+        ].filter(Boolean) as string[];
+        for (const sel of selectors) {
+          const el = document.querySelector(sel) as HTMLElement;
+          if (el) { el.scrollIntoView({ block: "center" }); el.click(); return `clicked: ${sel}`; }
+        }
+        return "not found";
+      }, name, value);
+      console.log(`[Check] ${result}`);
     }
     return;
   }
 
   if (action.type === "click") {
+    const idMatch = selector.match(/id="([^"]+)"/);
+
+    if (idMatch) {
+      const result = await page.evaluate((id: string) => {
+        const el = document.getElementById(id);
+        if (el) { el.scrollIntoView({ block: "center" }); el.click(); return `clicked #${id}`; }
+        return `#${id} not found`;
+      }, idMatch[1]);
+      console.log(`[Click] ${result}`);
+      return;
+    }
+
     if (cssSelector) {
       try {
         await page.waitForSelector(cssSelector, { timeout: 8000 });
-        await page.click(cssSelector);
+        await page.evaluate((sel: string) => {
+          const el = document.querySelector(sel) as HTMLElement;
+          if (el) { el.scrollIntoView({ block: "center" }); el.click(); }
+        }, cssSelector);
         return;
       } catch (e) {}
     }
-    const idMatch = selector.match(/id="([^"]+)"/);
-    if (idMatch) {
-      await page.evaluate((id: string) => {
-        const el = document.getElementById(id);
-        if (el) el.click();
-      }, idMatch[1]);
-      return;
-    }
+
     const typeMatch = selector.match(/type="([^"]+)"/);
     if (typeMatch && typeMatch[1] === "submit") {
-      await page.evaluate(() => {
-        const btn = document.querySelector('button[type="submit"], input[type="submit"]') as HTMLElement;
-        if (btn) btn.click();
+      const result = await page.evaluate(() => {
+        const btn = document.querySelector('#btnSub, button[type="submit"], input[type="submit"]') as HTMLElement;
+        if (btn) { btn.scrollIntoView({ block: "center" }); btn.click(); return `clicked submit: ${btn.id || btn.tagName}`; }
+        return "submit not found";
       });
+      console.log(`[Click] ${result}`);
     }
     return;
   }
