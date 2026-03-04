@@ -266,6 +266,10 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
     const client = await page.target().createCDPSession();
     await client.send("Network.clearBrowserCookies");
     await client.send("Network.clearBrowserCache");
+    await client.send("Storage.clearDataForOrigin", {
+      origin: new URL(task.targetUrl).origin,
+      storageTypes: "all",
+    });
 
     await page.setViewport({ width: 1366, height: 768 });
 
@@ -284,6 +288,11 @@ async function performPageVote(browser: any, proxyAuth: { username: string; pass
       Object.defineProperty(navigator, "languages", { get: () => ["ar-EG", "ar", "en-US", "en"] });
       Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
       (window as any).chrome = { runtime: {} };
+    });
+
+    await page.evaluateOnNewDocument(() => {
+      localStorage.clear();
+      sessionStorage.clear();
     });
 
     await page.goto(task.targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
