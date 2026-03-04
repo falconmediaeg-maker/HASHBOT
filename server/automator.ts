@@ -133,7 +133,11 @@ function buildBrowserArgs(proxy?: ProxyInfo): string[] {
     "--js-flags=--max-old-space-size=128",
     "--window-size=1366,768",
   ];
-  if (proxy) args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
+  if (proxy) {
+    args.push(`--proxy-server=http://${proxy.host}:${proxy.port}`);
+    args.push("--ignore-certificate-errors");
+    args.push("--ignore-certificate-errors-spki-list");
+  }
   return args;
 }
 
