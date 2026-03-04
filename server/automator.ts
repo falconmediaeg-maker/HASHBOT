@@ -221,7 +221,7 @@ async function performPageVote(browser: any, task: Task, runNumber: number): Pro
       sessionStorage.clear();
     });
 
-    await page.goto(task.targetUrl, { waitUntil: "networkidle2", timeout: 30000 });
+    await page.goto(task.targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
     const loadedUrl = page.url();
     if (loadedUrl.includes("chrome-error") || loadedUrl === "about:blank") {
@@ -250,11 +250,19 @@ async function performPageVote(browser: any, task: Task, runNumber: number): Pro
     let currentUrl = "";
     try { currentUrl = page.url(); } catch (_e) { currentUrl = "redirected"; }
 
+    let pageText = "";
+    try {
+      pageText = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || "");
+    } catch (_e) {}
+
     page.removeAllListeners();
     await page.close();
 
+    const textOneLine = pageText.replace(/\s+/g, " ").trim();
+    console.log(`[Vote] Run #${runNumber} URL=${currentUrl} | TEXT=${textOneLine}`);
+
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
-    return { message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - Final: ${currentUrl}` };
+    return { message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - URL:${currentUrl} - ${textOneLine.slice(0, 120)}` };
   } catch (error: any) {
     try { page.removeAllListeners(); await page.close(); } catch (_) {}
     if (error.message?.includes("detached") || error.message?.includes("navigation")) {
