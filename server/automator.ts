@@ -104,7 +104,7 @@ function parseProxyData(data: string, resolve: () => void): void {
     }
   }
   if (parsed.length > 0) {
-    proxyList = parsed.slice(0, 500);
+    proxyList = parsed.slice(0, 50);
     console.log(`[Proxy] Fetched ${parsed.length} proxies, using ${proxyList.length}`);
   } else {
     console.log(`[Proxy] No valid proxies parsed. Lines count: ${lines.length}`);
@@ -151,59 +151,49 @@ async function createBrowser(proxy?: ProxyInfo): Promise<any> {
 
 function isHighMemory(): boolean {
   const rss = process.memoryUsage().rss;
+  const rssMB = rss / 1024 / 1024;
   const total = os.totalmem();
   const pct = (rss / total) * 100;
-  if (pct > 60) {
-    console.log(`[Memory Guard] ${Math.round(pct)}% RAM used, recycling browser...`);
+  if (pct > 50 || rssMB > 400) {
+    console.log(`[Memory Guard] ${Math.round(pct)}% RAM / ${Math.round(rssMB)}MB used, recycling browser...`);
     return true;
   }
   return false;
 }
 
-export async function executeTask(task: Task) {
-  if (isTaskRunning(task.id)) return;
+interface SharedState {
+  completed: number;
+  failed: number;
+  totalAttempts: number;
+}
 
-  runningTasks.set(task.id, true);
-  await storage.updateTask(task.id, { status: "running", completedRuns: 0, failedRuns: 0 });
-  console.log(`[Task] Starting ${task.repetitions} runs`);
-
-  await fetchProxyList();
-
+async function runWorker(workerId: number, task: Task, state: SharedState, concurrency: number) {
   let currentProxy = getNextProxy();
   let browser = await createBrowser(currentProxy || undefined);
-  let consecutiveFailures = 0;
+  let localRuns = 0;
+  let localConsecFails = 0;
 
-  for (let i = 1; i <= task.repetitions; i++) {
-    if (!runningTasks.get(task.id)) {
-      await storage.updateTask(task.id, { status: "stopped" });
-      await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "stopped", message: "Task stopped by user" });
-      break;
-    }
+  while (runningTasks.get(task.id) && state.completed < task.repetitions) {
+    localRuns++;
+    const runNumber = ++state.totalAttempts;
 
     if (!browser || !browser.isConnected()) {
-      console.log("[Recovery] Browser disconnected, relaunching...");
       try { await browser?.close(); } catch {}
       currentProxy = getNextProxy();
       browser = await createBrowser(currentProxy || undefined);
     }
 
-    if (i > 1 && i % 5 === 1) {
-      console.log("[Recycle] Restarting browser to free memory...");
+    if (localRuns > 1 && localRuns % 15 === 1) {
+      console.log(`[W${workerId}] Recycling browser...`);
       try { await browser.close(); } catch {}
-      currentProxy = getNextProxy();
-      browser = await createBrowser(currentProxy || undefined);
-    }
-
-    if (i > 1 && i % 200 === 1) {
-      console.log("[Batch] 200-run batch complete, pausing 30s...");
-      try { await browser.close(); } catch {}
-      await delay(30000);
       currentProxy = getNextProxy();
       browser = await createBrowser(currentProxy || undefined);
     }
 
     if (isHighMemory()) {
+      console.log(`[W${workerId}] High memory, recycling...`);
       try { await browser.close(); } catch {}
+      await delay(2000 * workerId);
       currentProxy = getNextProxy();
       browser = await createBrowser(currentProxy || undefined);
     }
@@ -212,51 +202,71 @@ export async function executeTask(task: Task) {
 
     try {
       const result = await Promise.race([
-        performPageVote(browser, task, i, currentProxy || undefined),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)
-        ),
+        performPageVote(browser, task, runNumber, currentProxy || undefined),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Run timeout after 60s")), 60000)),
       ]);
-      consecutiveFailures = 0;
-      const currentTask = await storage.getTask(task.id);
-      if (currentTask) await storage.updateTask(task.id, { completedRuns: (currentTask.completedRuns || 0) + 1 });
-      await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "success", ipUsed: proxyLabel, message: result.message });
-      console.log(`[Task] Run ${i}/${task.repetitions} SUCCESS - ${proxyLabel}`);
+      localConsecFails = 0;
+      state.completed++;
+      await storage.updateTask(task.id, { completedRuns: state.completed, failedRuns: state.failed });
+      await storage.createTaskLog({ taskId: task.id, runNumber, status: "success", ipUsed: proxyLabel, message: result.message });
+      console.log(`[W${workerId}] Run ${runNumber} SUCCESS (${state.completed}/${task.repetitions}) - ${proxyLabel}`);
     } catch (error: any) {
-      consecutiveFailures++;
-      const currentTask = await storage.getTask(task.id);
-      if (currentTask) await storage.updateTask(task.id, { failedRuns: (currentTask.failedRuns || 0) + 1 });
-      await storage.createTaskLog({ taskId: task.id, runNumber: i, status: "failed", message: error.message || "Unknown error" });
-      console.log(`[Task] Run ${i}/${task.repetitions} FAILED - ${error.message} (consecutive: ${consecutiveFailures})`);
+      const isIPBlock = error.message?.includes("hard_block") || error.message?.includes("Cloudflare block") || error.message?.includes("cookie_block");
 
-      if (consecutiveFailures >= 5) {
-        console.log("[Self-Heal] 5 consecutive failures, restarting service...");
-        try { await browser.close(); } catch {}
-        process.exit(1);
-      }
+      state.failed++;
+      await storage.updateTask(task.id, { completedRuns: state.completed, failedRuns: state.failed });
+      await storage.createTaskLog({ taskId: task.id, runNumber, status: "failed", message: error.message || "Unknown error" });
 
-      if (error.message?.includes("timeout") || error.message?.includes("Protocol") || error.message?.includes("Target closed")) {
-        console.log("[Recovery] Critical error, relaunching browser...");
-        try { await browser.close(); } catch {}
-        try {
+      if (isIPBlock) {
+        console.log(`[W${workerId}] IP blocked run ${runNumber}, skipping...`);
+        localConsecFails = 0;
+      } else {
+        localConsecFails++;
+        console.log(`[W${workerId}] Run ${runNumber} FAILED - ${error.message} (consec: ${localConsecFails})`);
+
+        if (error.message?.includes("ERR_TUNNEL_CONNECTION_FAILED")) {
+          try { await browser.close(); } catch {}
           currentProxy = getNextProxy();
           browser = await createBrowser(currentProxy || undefined);
-        } catch (relaunchErr: any) {
-          console.log(`[Recovery] Relaunch failed: ${relaunchErr.message}`);
+        } else if (error.message?.includes("timeout") || error.message?.includes("Protocol") || error.message?.includes("Target closed")) {
+          try { await browser.close(); } catch {}
+          currentProxy = getNextProxy();
+          browser = await createBrowser(currentProxy || undefined);
+        }
+
+        if (localConsecFails >= 10) {
+          console.log(`[W${workerId}] 10 consecutive failures, exiting worker...`);
+          break;
         }
       }
     }
 
-    if (i < task.repetitions && runningTasks.get(task.id)) {
-      await delay(Math.max(task.delayMs, 7000));
+    if (runningTasks.get(task.id) && state.completed < task.repetitions) {
+      await delay(task.delayMs);
     }
   }
 
-  try { await browser.close(); } catch (_) {}
+  try { await browser.close(); } catch {}
+  console.log(`[W${workerId}] Done`);
+}
+
+export async function executeTask(task: Task, concurrency = 3) {
+  if (isTaskRunning(task.id)) return;
+
+  runningTasks.set(task.id, true);
+  await storage.updateTask(task.id, { status: "running", completedRuns: 0, failedRuns: 0 });
+  console.log(`[Task] Starting ${task.repetitions} runs with ${concurrency} workers`);
+
+  await fetchProxyList();
+
+  const state: SharedState = { completed: 0, failed: 0, totalAttempts: 0 };
+  const workers = Array.from({ length: concurrency }, (_, i) => runWorker(i + 1, task, state, concurrency));
+  await Promise.all(workers);
+
   activeBrowser = null;
   if (runningTasks.get(task.id)) await storage.updateTask(task.id, { status: "completed" });
   runningTasks.delete(task.id);
-  console.log(`[Task] Finished`);
+  console.log(`[Task] All workers finished - ${state.completed} votes cast`);
 }
 
 async function performPageVote(browser: any, task: Task, runNumber: number, proxy?: ProxyInfo): Promise<{ message: string }> {
@@ -336,17 +346,17 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
     const cfStatus = await page.evaluate(() => {
       const text = document.body?.innerText || "";
       const html = document.body?.innerHTML || "";
-      if (text.includes("you have been blocked") || text.includes("unable to access")) return "hard_block";
-      if (text.includes("enable cookies") || text.includes("Enable Cookies")) return "cookie_block";
+      if (text.includes("you have been blocked") || text.includes("Sorry, you have been blocked")) return "hard_block";
+      if (html.includes("cf-wrapper") || text.includes("enable cookies") || text.includes("Enable Cookies")) return "cookie_block";
       if (text.includes("Performing security verification") || text.includes("security service") || text.includes("checking your browser")) return "challenge";
       return "ok";
     });
 
     if (cfStatus === "hard_block" || cfStatus === "cookie_block") {
-      console.log(`[CF] Hard block detected (${cfStatus}), proxy is banned - skipping run`);
+      console.log(`[CF] Block detected (${cfStatus}), will pause 3 min`);
       page.removeAllListeners();
       await page.close();
-      throw new Error(`Cloudflare hard block (${cfStatus}) - proxy banned`);
+      throw new Error(`Cloudflare block (${cfStatus})`);
     }
 
     if (cfStatus === "challenge") {
@@ -356,8 +366,7 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
       await delay(3000);
       const afterChallenge = await page.evaluate(() => {
         const text = document.body?.innerText || "";
-        const html = document.body?.innerHTML || "";
-        if (text.includes("you have been blocked") || text.includes("unable to access")) return "hard_block";
+        if (text.includes("you have been blocked") || text.includes("Sorry, you have been blocked")) return "hard_block";
         if (text.includes("enable cookies")) return "cookie_block";
         if (text.includes("Performing security verification") || text.includes("security service")) return "challenge";
         return "ok";
@@ -426,10 +435,6 @@ async function performPageVote(browser: any, task: Task, runNumber: number, prox
 
     const textOneLine = pageText.replace(/\s+/g, " ").trim();
     console.log(`[Vote] Run #${runNumber} URL=${currentUrl} | TEXT=${textOneLine.slice(0, 150)}`);
-
-    if (textOneLine.includes("you have been blocked") || textOneLine.includes("unable to access")) {
-      throw new Error(`WAF block after vote - IP blocked`);
-    }
 
     const voted = currentUrl.includes("/result") || currentUrl !== task.targetUrl;
     return { message: `Run #${runNumber} - ${voted ? "VOTED" : "DONE"} - URL:${currentUrl} - ${textOneLine.slice(0, 120)}` };
