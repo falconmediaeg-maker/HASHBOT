@@ -54,6 +54,16 @@ let proxyList: ProxyInfo[] = [];
 let proxyIndex = 0;
 
 async function fetchProxyList(): Promise<void> {
+  const directHost = process.env.PROXY_HOST;
+  const directPort = process.env.PROXY_PORT;
+  const directUser = process.env.PROXY_USER;
+  const directPass = process.env.PROXY_PASS;
+  if (directHost && directPort && directUser && directPass) {
+    proxyList = [{ host: directHost, port: directPort, user: directUser, pass: directPass }];
+    console.log(`[Proxy] Using direct proxy: ${directHost}:${directPort}`);
+    return;
+  }
+
   const url = process.env.WEBSHARE_PROXY_URL;
   if (!url) return;
   console.log("[Proxy] Fetching proxy list...");
