@@ -156,9 +156,7 @@ export async function executeTask(task: Task) {
   await storage.updateTask(task.id, { status: "running", completedRuns: 0, failedRuns: 0 });
   console.log(`[Task] Starting ${task.repetitions} runs`);
 
-  const webshareUrl = process.env.WEBSHARE_PROXY_URL;
-  let proxies: string[] = [];
-  if (webshareUrl) proxies = await fetchProxyList(webshareUrl);
+  const proxies: string[] = [];
 
   let { browser, proxyAuth, proxyLabel } = await createBrowser(proxies);
   let consecutiveFailures = 0;
